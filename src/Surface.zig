@@ -4771,8 +4771,8 @@ fn bidiMirroredBindingEvent(self: *Surface, event: input.KeyEvent) input.KeyEven
     }
 
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         if (!self.cursorRowIsRtl()) return event;
     }
     return mirrored;
@@ -6467,8 +6467,8 @@ fn maybePromptSelectionMove(self: *Surface, event: input.KeyEvent) !bool {
         }
     }
 
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     return self.promptSelectionExtendLocked(
         event.key == .arrow_left,
@@ -6649,8 +6649,8 @@ fn maybePromptSelectionEdit(self: *Surface, event: input.KeyEvent) !PromptSelect
     const intent = promptSelectionEditIntent(event);
     if (intent == .none) return .none;
 
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     const t: *terminal.Terminal = self.renderer_state.terminal;
     const screen: *terminal.Screen = t.screens.active;
