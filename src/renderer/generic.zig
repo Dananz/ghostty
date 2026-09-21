@@ -13,6 +13,11 @@ const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
+const bidi_unicode = @import("../bidi_unicode.zig");
+const bidi_row = @import("../bidi_row.zig");
+const BidiRowMap = bidi_row.BidiRowMap;
+const bidiRowMap = bidi_row.bidiRowMap;
+const cellCodepointForBidi = bidi_row.cellCodepointForBidi;
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
@@ -785,8 +790,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             font_features: std.ArrayListUnmanaged([:0]const u8),
             font_styles: font.CodepointResolver.StyleStatus,
             font_shaping_break: configpkg.FontShapingBreak,
+            bidi: bool,
+            bidi_direction: configpkg.Config.BidiDirection,
             cursor_color: ?configpkg.Config.TerminalColor,
             cursor_opacity: f64,
+            cursor_hide_while_selecting: bool,
+            bidi_mirror_arrows: bool,
             cursor_text: ?configpkg.Config.TerminalColor,
             background: terminal.color.RGB,
             background_opacity: f64,
@@ -857,10 +866,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .font_features = font_features.list,
                     .font_styles = font_styles,
                     .font_shaping_break = config.@"font-shaping-break",
+                    .bidi = config.bidi,
+                    .bidi_direction = config.@"bidi-direction",
 
                     .cursor_color = config.@"cursor-color",
                     .cursor_text = config.@"cursor-text",
                     .cursor_opacity = @max(0, @min(1, config.@"cursor-opacity")),
+                    .cursor_hide_while_selecting = config.@"cursor-hide-while-selecting",
+                    .bidi_mirror_arrows = config.@"bidi-mirror-arrows",
 
                     .background = config.background.toTerminalRGB(),
                     .foreground = config.foreground.toTerminalRGB(),
@@ -1704,6 +1717,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .preedit = critical.preedit != null,
                         .focused = self.focused,
                         .blink_visible = cursor_blink_visible,
+                        .hide_while_selecting = self.config.cursor_hide_while_selecting,
                     }),
                     &critical.links,
                 ) catch |err| {
@@ -3027,23 +3041,70 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :cursor_color state.colors.foreground;
                 };
 
+                // Bidi moves the cursor along with the text it sits in, so
+                // resolve the cursor row's order here rather than reusing the
+                // map built during rebuildRow: rows are only rebuilt when
+                // dirty, so on any frame that leaves the cursor's row alone
+                // (a blink, an edit elsewhere) that map is never produced and
+                // the cursor would snap back to its logical column.
+                const cursor_visual_x: ?terminal.size.CellCountInt = visual: {
+                    if (!self.config.bidi) break :visual null;
+                    if (cursor_vp.y >= row_len) break :visual null;
+
+                    const c_slice = row_cells[cursor_vp.y].slice();
+                    const c_len = @min(c_slice.len, self.cells.size.columns);
+                    if (c_len == 0) break :visual null;
+                    const c_raw = c_slice.items(.raw);
+
+                    var content_len: usize = 0;
+                    for (c_raw[0..c_len], 0..) |*c, i| {
+                        if (c.hasText()) content_len = i + 1;
+                    }
+                    if (content_len == 0) break :visual null;
+
+                    // We are past `errdefer comptime unreachable`, so failures
+                    // here degrade to the logical column instead of erroring.
+                    const cps = self.alloc.alloc(u21, content_len) catch
+                        break :visual null;
+                    defer self.alloc.free(cps);
+                    for (c_raw[0..content_len], 0..) |*c, i| {
+                        cps[i] = cellCodepointForBidi(c);
+                    }
+
+                    const map = (bidiRowMap(
+                        self.alloc,
+                        cps,
+                        c_len,
+                        self.config.bidi_direction == .rtl,
+                    ) catch break :visual null) orelse break :visual null;
+                    defer map.deinit(self.alloc);
+
+                    if (cursor_vp.x >= map.logical_to_visual.len) break :visual null;
+                    break :visual @intCast(map.logical_to_visual[cursor_vp.x]);
+                };
+
                 self.addCursor(
                     &state.cursor,
                     style,
                     cursor_color,
+                    cursor_visual_x,
                 );
 
                 // If the cursor is visible then we set our uniforms.
                 if (style == .block) {
                     const wide = state.cursor.cell.wide;
 
+                    // The shader inverts the cell under the cursor, so this is a
+                    // screen position and has to follow bidi reordering too.
+                    const pos_x = cursor_visual_x orelse cursor_vp.x;
+
                     self.uniforms.cursor_pos = .{
                         // If we are a spacer tail of a wide cell, our cursor needs
                         // to move back one cell. The saturate is to ensure we don't
                         // overflow but this shouldn't happen with well-formed input.
                         switch (wide) {
-                            .narrow, .spacer_head, .wide => cursor_vp.x,
-                            .spacer_tail => cursor_vp.x -| 1,
+                            .narrow, .spacer_head, .wide => pos_x,
+                            .spacer_tail => pos_x -| 1,
                         },
                         @intCast(cursor_vp.y + state.top_overscan_rows),
                     };
@@ -3189,6 +3250,47 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
             };
             run_iter_opts.applyBreakConfig(self.config.font_shaping_break);
+
+            // Bidi: resolve this row's visual order when enabled.
+            var bidi_levels: ?[]const u8 = null;
+            var logical_to_visual: ?[]u16 = null;
+            defer if (logical_to_visual) |m| self.alloc.free(m);
+            defer if (bidi_levels) |lv| self.alloc.free(lv);
+            if (self.config.bidi and cells_len > 0) {
+                // Reorder only the CONTENT portion of the row (up to the last
+                // cell with text). The per-row base direction depends on the
+                // user's toggle:
+                //   ltr -> force LTR: every row stays LEFT-anchored (a Hebrew
+                //          run still reads R->L internally but does not stick to
+                //          the right edge). The English TUI is unaffected.
+                //   rtl -> auto (UAX#9 first-strong) per row: a Hebrew/Arabic-
+                //          first row resolves RTL and is RIGHT-anchored/mirrored;
+                //          a Latin-first row stays LTR/left-anchored. So only the
+                //          actual Hebrew lines flip, not the whole CLI.
+                const auto = self.config.bidi_direction == .rtl;
+                var content_len: usize = 0;
+                for (cells_raw[0..cells_len], 0..) |*c, i| {
+                    if (c.hasText()) content_len = i + 1;
+                }
+                if (content_len > 0) {
+                    const cps = try self.alloc.alloc(u21, content_len);
+                    defer self.alloc.free(cps);
+                    for (cells_raw[0..content_len], 0..) |*c, i| {
+                        cps[i] = cellCodepointForBidi(c);
+                    }
+                    if (try bidiRowMap(self.alloc, cps, cells_len, auto)) |map| {
+                        bidi_levels = map.levels; // freed by defer
+                        logical_to_visual = map.logical_to_visual; // freed by defer
+                    }
+                }
+            }
+            run_iter_opts.bidi_levels = bidi_levels;
+            // Mirror arrow hints only on rows that actually reordered, which
+            // are the rows whose arrow keys are mirrored too.
+            run_iter_opts.mirror_arrows = self.config.bidi_mirror_arrows and
+                self.config.bidi_direction == .rtl and
+                bidi_levels != null;
+
             var run_iter = self.font_shaper.runIterator(run_iter_opts);
             var shaper_run: ?font.shape.TextRun = try run_iter.next(self.alloc);
             var shaper_cells: ?[]const font.shape.Cell = null;
@@ -3264,6 +3366,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 const wide = cell.wide;
+
+                // Visual column this cell is drawn at. Bidi reordering makes
+                // this differ from the logical index `x`, which stays the key
+                // for looking up cell CONTENT (codepoint, style, links).
+                // Everything painted into the grid has to use this instead,
+                // or a right-to-left row draws its glyphs in one place and its
+                // background, selection highlight and decorations in another.
+                const draw_x: u16 = if (logical_to_visual) |l2v|
+                    l2v[x]
+                else
+                    @intCast(x);
                 const style: terminal.Style = if (cell.hasStyling())
                     managed_style.*
                 else
@@ -3431,7 +3544,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         break :bg_alpha 0;
                     };
 
-                    self.cells.bgCell(y, x).* = .{
+                    self.cells.bgCell(y, draw_x).* = .{
                         rgb.r, rgb.g, rgb.b, bg_alpha,
                     };
                 }
@@ -3471,7 +3584,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // This improves readability when a colored underline is used
                 // which intersects parts of the text (descenders).
                 if (underline != .none) self.addUnderline(
-                    @intCast(x),
+                    draw_x,
                     @intCast(y),
                     underline,
                     style.underlineColor(&state.colors.palette) orelse fg,
@@ -3483,7 +3596,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     );
                 };
 
-                if (style.flags.overline) self.addOverline(@intCast(x), @intCast(y), fg, alpha) catch |err| {
+                if (style.flags.overline) self.addOverline(draw_x, @intCast(y), fg, alpha) catch |err| {
                     log.warn(
                         "error adding overline to cell, will be invalid x={} y={}, err={}",
                         .{ x, y, err },
@@ -3536,7 +3649,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // If we encounter a shaper cell to the left of the current
                     // cell then we have some problems. This logic relies on x
                     // position monotonically increasing.
-                    assert(run.offset + shaped_cells[shaper_cells_i].x >= x);
+                    if (run.direction == .ltr) {
+                        assert(run.offset + shaped_cells[shaper_cells_i].x >= x);
+                    }
 
                     // NOTE: An assumption is made here that a single cell will never
                     // be present in more than one shaper run. If that assumption is
@@ -3547,6 +3662,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         shaper_cells_i += 1;
                     }) {
                         self.addGlyph(
+                            draw_x,
                             @intCast(x),
                             @intCast(y),
                             state.cols,
@@ -3566,7 +3682,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Finally, draw a strikethrough if necessary.
                 if (style.flags.strikethrough) self.addStrikethrough(
-                    @intCast(x),
+                    draw_x,
                     @intCast(y),
                     fg,
                     alpha,
@@ -3685,7 +3801,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         // Add a glyph to the specified cell.
         fn addGlyph(
             self: *Self,
+            // Visual screen column where the glyph is drawn (bidi may differ
+            // from logical_x). Used only for grid_pos.
             x: terminal.size.CellCountInt,
+            // Logical cell index into cell_raws for this glyph's attributes
+            // (codepoint, width, constraint). Equals x when bidi is off.
+            logical_x: terminal.size.CellCountInt,
             y: terminal.size.CellCountInt,
             cols: usize,
             cell_raws: []const terminal.page.Cell,
@@ -3694,7 +3815,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             color: terminal.color.RGB,
             alpha: u8,
         ) !void {
-            const cell = cell_raws[x];
+            const cell = cell_raws[logical_x];
             const cp = cell.codepoint();
 
             // Render
@@ -3716,7 +3837,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         } else .none,
                     .constraint_width = constraintWidth(
                         cell_raws,
-                        x,
+                        logical_x,
                         cols,
                     ),
                 },
@@ -3750,21 +3871,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cursor_state: *const terminal.RenderState.Cursor,
             cursor_style: renderer.CursorStyle,
             cursor_color: terminal.color.RGB,
+            // Screen column the cursor's row reordered it to, when bidi is on.
+            // Null means no reordering applies and the logical column is used.
+            visual_x: ?terminal.size.CellCountInt,
         ) void {
             const cursor_vp = cursor_state.viewport orelse return;
 
             // Add the cursor. We render the cursor over the wide character if
             // we're on the wide character tail.
             const wide, const x = cell: {
+                const base_x = visual_x orelse cursor_vp.x;
+
                 // The cursor goes over the screen cursor position.
                 if (!cursor_vp.wide_tail) break :cell .{
                     cursor_state.cell.wide == .wide,
-                    cursor_vp.x,
+                    base_x,
                 };
 
                 // If we're part of a wide character, we move the cursor back
                 // to the actual character.
-                break :cell .{ true, cursor_vp.x - 1 };
+                break :cell .{ true, base_x - 1 };
             };
 
             const alpha: u8 = if (!self.focused) 255 else alpha: {

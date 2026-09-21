@@ -33,6 +33,8 @@ const terminal = @import("terminal/main.zig");
 const configpkg = @import("config.zig");
 const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
+const bidi_unicode = @import("bidi_unicode.zig");
+const bidi_row = @import("bidi_row.zig");
 const App = @import("App.zig");
 const internal_os = @import("os/main.zig");
 const inspectorpkg = @import("inspector/main.zig");
@@ -521,6 +523,7 @@ const DerivedConfig = struct {
     middle_click_action: configpkg.MiddleClickAction,
     confirm_close_surface: configpkg.ConfirmCloseSurface,
     cursor_click_to_move: bool,
+    selection_edit_at_prompt: bool,
     desktop_notifications: bool,
     font: font.SharedGridSet.DerivedConfig,
     mouse_interval: u64,
@@ -531,6 +534,11 @@ const DerivedConfig = struct {
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
     macos_option_as_alt: ?input.OptionAsAlt,
+    /// True when the display is mirrored, so the horizontal arrow keys are
+    /// swapped to follow the text as drawn. See key_encode.Options.
+    bidi_swap_arrows: bool,
+    bidi: bool,
+    bidi_rtl: bool,
     selection_clear_on_copy: bool,
     selection_clear_on_typing: bool,
     selection_word_chars: []const u21,
@@ -606,6 +614,7 @@ const DerivedConfig = struct {
             .middle_click_action = config.@"middle-click-action",
             .confirm_close_surface = config.@"confirm-close-surface",
             .cursor_click_to_move = config.@"cursor-click-to-move",
+            .selection_edit_at_prompt = config.@"selection-edit-at-prompt",
             .desktop_notifications = config.@"desktop-notifications",
             .font = try font.SharedGridSet.DerivedConfig.init(alloc, config),
             .mouse_interval = config.@"click-repeat-interval" * 1_000_000, // 500ms
@@ -616,6 +625,9 @@ const DerivedConfig = struct {
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
             .macos_option_as_alt = config.@"macos-option-as-alt",
+            .bidi_swap_arrows = config.bidi and config.@"bidi-direction" == .rtl,
+            .bidi = config.bidi,
+            .bidi_rtl = config.@"bidi-direction" == .rtl,
             .selection_clear_on_copy = config.@"selection-clear-on-copy",
             .selection_clear_on_typing = config.@"selection-clear-on-typing",
             .selection_word_chars = try alloc.dupe(u21, config.@"selection-word-chars".codepoints),
@@ -1549,7 +1561,7 @@ fn selectionScrollTick(self: *Surface) !void {
     const t: *terminal.Terminal = self.renderer_state.terminal;
 
     const selection = self.mouse.selection_gesture.autoscrollTick(t, .{
-        .viewport = pos_vp,
+        .viewport = self.logicalViewportPoint(pos_vp),
         .xpos = pos.x,
         .ypos = pos.y,
         .rectangle = SurfaceMouse.isRectangleSelectState(self.mouse.mods),
@@ -1977,7 +1989,9 @@ fn mouseRefreshLinks(
         }
 
         const screen = self.renderer_state.terminal.screens.active;
-        const mouse_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse
+        const mouse_pin = screen.pages.pin(.{
+            .viewport = self.logicalViewportPoint(pos_vp),
+        }) orelse
             break :link .{ null, false };
         const effective_mods = if (self.mouse.link_click_active)
             input.ctrlOrSuper(.{})
@@ -2022,7 +2036,9 @@ fn mouseRefreshLinks(
                 self.mouse.link_point = null;
                 break :link .{ null, false };
             }
-            const current_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse {
+            const current_pin = screen.pages.pin(.{
+                .viewport = self.logicalViewportPoint(pos_vp),
+            }) orelse {
                 self.mouse.link_point = null;
                 break :link .{ null, false };
             };
@@ -4651,9 +4667,31 @@ pub fn keyCallback(
         break :event copy;
     };
 
+    // If there's a selection at the prompt, this key may need to delete it
+    // first so that typing replaces it the way it would in a text editor.
+    // Must run before encodeKey, which takes the renderer lock itself.
+    // Shift+arrow builds a selection at the prompt instead of moving the
+    // shell's cursor. Runs before the edit hook below, which only cares about
+    // text and delete keys, so the two never contend for the same key.
+    if (self.maybePromptSelectionMove(event) catch |err| moved: {
+        log.warn("error moving prompt selection err={}", .{err});
+        break :moved false;
+    }) return .consumed;
+
+    const prompt_selection_edit = self.maybePromptSelectionEdit(event) catch |err| edit: {
+        log.warn("error editing prompt selection err={}", .{err});
+        break :edit .none;
+    };
+
     // Encode and send our key. If we didn't encode anything, then we
     // return the effect as ignored.
-    if (try self.encodeKey(
+    //
+    // Backspace/delete over a prompt selection is the exception: deleting the
+    // selection was the whole request, so encoding the key as well would eat
+    // one more character. We still fall through to the bookkeeping below.
+    if (prompt_selection_edit == .deleted) {
+        // Deleting the selection already wrote to the pty.
+    } else if (try self.encodeKey(
         event,
         if (insp_ev) |*ev| ev else null,
     )) |write_req| {
@@ -4700,11 +4738,52 @@ pub fn keyCallback(
 /// Maybe handles a binding for a given event and if so returns the effect.
 /// Returns null if the event is not handled in any way and processing should
 /// continue.
+/// Mirror a horizontal arrow before binding lookup when the cursor's row is
+/// drawn right-to-left.
+///
+/// The plain arrows are mirrored when the key is encoded, but the modified ones
+/// resolve as keybindings first and never reach that code. On macOS ghostty
+/// binds them to fixed sequences - alt+left sends ESC b (word back), super+left
+/// sends \x01 (line start) - so without this they move opposite to the arrow on
+/// a mirrored row.
+///
+/// The mirrored binding is only used when it emits text. That deliberately
+/// leaves super+alt+arrow alone: it moves pane focus, and panes follow the
+/// physical screen rather than the text.
+fn bidiMirroredBindingEvent(self: *Surface, event: input.KeyEvent) input.KeyEvent {
+    if (!self.config.bidi_swap_arrows) return event;
+    const mirrored_key: input.Key = switch (event.key) {
+        .arrow_left => .arrow_right,
+        .arrow_right => .arrow_left,
+        else => return event,
+    };
+
+    var mirrored = event;
+    mirrored.key = mirrored_key;
+    const entry = self.config.keybind.set.getEvent(mirrored) orelse return event;
+    const leaf = switch (entry.value_ptr.*) {
+        .leaf => |l| l,
+        .leader, .leaf_chained => return event,
+    };
+    switch (leaf.action) {
+        .text, .esc, .csi => {},
+        else => return event,
+    }
+
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        if (!self.cursorRowIsRtl()) return event;
+    }
+    return mirrored;
+}
+
 fn maybeHandleBinding(
     self: *Surface,
-    event: input.KeyEvent,
+    event_: input.KeyEvent,
     insp_ev: ?*inspectorpkg.KeyEvent,
 ) !?InputEffect {
+    const event = self.bidiMirroredBindingEvent(event_);
     switch (event.action) {
         // Release events never trigger a binding but we need to check if
         // we consumed the press event so we don't encode the release.
@@ -5112,12 +5191,104 @@ fn encodeKey(
     return write_req;
 }
 
+/// Map a viewport coordinate whose `x` is a SCREEN column to the logical cell
+/// sitting there, undoing the row's bidi reordering.
+///
+/// Everything downstream of the mouse works in logical cells: pins, links,
+/// selections. `posToViewport` produces a screen column, and on a row that
+/// bidi reordered, the two are different cells. Feeding the screen column
+/// straight in is why dragging across Hebrew selected the wrong text.
+///
+/// Rows that did not reorder, which is every Latin row, come back unchanged.
+///
+/// Caller must already hold the renderer mutex.
+fn logicalViewportPoint(
+    self: *Surface,
+    vp: terminal.point.Coordinate,
+) terminal.point.Coordinate {
+    if (!self.config.bidi) return vp;
+
+    const screen = self.io.terminal.screens.active;
+    const row_pin = screen.pages.pin(.{ .viewport = .{
+        .x = 0,
+        .y = vp.y,
+    } }) orelse return vp;
+
+    // Must match the renderer's row width exactly. It clamps to the grid
+    // columns, and the row map right-anchors by `width - content`, so a
+    // different width here shifts every column and the inverse stops being an
+    // inverse.
+    const all_cells = row_pin.cells(.all);
+    const cells = all_cells[0..@min(all_cells.len, self.io.terminal.cols)];
+    if (cells.len == 0) return vp;
+
+    // Content runs to the last cell with text, matching the renderer.
+    var content_len: usize = 0;
+    for (cells, 0..) |*c, i| {
+        if (c.hasText()) content_len = i + 1;
+    }
+    if (content_len == 0) return vp;
+
+    const cps = self.alloc.alloc(u21, content_len) catch return vp;
+    defer self.alloc.free(cps);
+    for (cells[0..content_len], 0..) |*c, i| {
+        cps[i] = bidi_row.cellCodepointForBidi(c);
+    }
+
+    const map = (bidi_row.bidiRowMap(
+        self.alloc,
+        cps,
+        cells.len,
+        self.config.bidi_rtl,
+    ) catch return vp) orelse return vp;
+    defer map.deinit(self.alloc);
+
+    const logical = map.visualToLogical(vp.x) orelse return vp;
+    return .{ .x = logical, .y = vp.y };
+}
+
+/// Whether the row the cursor sits on is drawn right-to-left.
+///
+/// The arrows mirror only on rows that are actually mirrored. A blanket swap
+/// whenever the direction toggle is on reverses the arrows in Latin text too,
+/// which is wrong: an English line is still drawn left-to-right.
+///
+/// This resolves the row exactly the way the renderer does when it decides
+/// whether to right-anchor, so the arrows always agree with what is on screen.
+/// Caller must already hold the renderer mutex.
+fn cursorRowIsRtl(self: *const Surface) bool {
+    const screen = self.io.terminal.screens.active;
+    const cells = screen.cursor.page_pin.cells(.all);
+    if (cells.len == 0) return false;
+
+    // Only the content matters; trailing blanks carry no direction.
+    var content_len: usize = 0;
+    for (cells, 0..) |*c, i| {
+        if (c.hasText()) content_len = i + 1;
+    }
+    if (content_len == 0) return false;
+
+    var buf: [256]u21 = undefined;
+    const len = @min(content_len, buf.len);
+    for (cells[0..len], 0..) |*c, i| {
+        buf[i] = if (c.hasText()) c.codepoint() else ' ';
+    }
+
+    const resolved = bidi_unicode.resolveRowAuto(self.alloc, buf[0..len]) catch return false;
+    defer {
+        self.alloc.free(resolved.visual);
+        self.alloc.free(resolved.levels);
+    }
+    return resolved.base == .rtl;
+}
+
 fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     const t = &self.io.terminal;
 
     var opts: input.key_encode.Options = .fromTerminal(t);
+    opts.bidi_swap_arrows = self.config.bidi_swap_arrows and self.cursorRowIsRtl();
     if (comptime builtin.os.tag != .macos) return opts;
 
     opts.macos_option_as_alt = self.config.macos_option_as_alt orelse detect: {
@@ -5524,11 +5695,34 @@ fn mouseReport(
     button: ?input.MouseButton,
     action: input.MouseAction,
     mods: input.Mods,
-    pos: apprt.CursorPos,
+    pos_: apprt.CursorPos,
 ) void {
     // Mouse reporting must be enabled by both config and terminal state
     assert(self.config.mouse_reporting);
     assert(self.io.terminal.flags.mouse_event != .none);
+
+    // Report the LOGICAL column, not the screen one.
+    //
+    // An application that takes over the screen addresses cells in its own
+    // column order and knows nothing about the bidi reordering we apply when
+    // drawing. Telling it the column the pointer is physically over makes it
+    // act on a different cell, and then it draws its own highlight there: a
+    // TUI selection over Hebrew lands somewhere other than where you dragged.
+    //
+    // The encoder derives the cell from pixels, so nudge the pixel into the
+    // middle of the logical cell rather than teaching it about bidi.
+    const pos: apprt.CursorPos = pos: {
+        if (!self.config.bidi) break :pos pos_;
+        const vp = self.posToViewport(pos_.x, pos_.y);
+        const logical = self.logicalViewportPoint(vp);
+        if (logical.x == vp.x) break :pos pos_;
+        const cell_w: f32 = @floatFromInt(self.size.cell.width);
+        const pad_l: f32 = @floatFromInt(self.size.padding.left);
+        break :pos .{
+            .x = pad_l + (@as(f32, @floatFromInt(logical.x)) + 0.5) * cell_w,
+            .y = pos_.y,
+        };
+    };
 
     // Build our encoding options.
     const encoding_opts: input.mouse_encode.Options = opts: {
@@ -5752,7 +5946,9 @@ pub fn mouseButtonCallback(
         // gesture can conservatively treat the release as having moved away
         // from the pressed cell.
         const release_pin: ?terminal.Pin = if (release_pos) |pos| pin: {
-            const release_vp = self.posToViewport(pos.x, pos.y);
+            const release_vp = self.logicalViewportPoint(
+                self.posToViewport(pos.x, pos.y),
+            );
             break :pin self.io.terminal.screens.active.pages.pin(.{ .viewport = .{
                 .x = release_vp.x,
                 .y = release_vp.y,
@@ -5887,7 +6083,9 @@ pub fn mouseButtonCallback(
 
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
-            const pt_viewport = self.posToViewport(pos.x, pos.y);
+            const pt_viewport = self.logicalViewportPoint(
+                self.posToViewport(pos.x, pos.y),
+            );
             const pin = screen.pages.pin(.{
                 .viewport = .{
                     .x = pt_viewport.x,
@@ -5995,7 +6193,9 @@ pub fn mouseButtonCallback(
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
-            const pt_viewport = self.posToViewport(pos.x, pos.y);
+            const pt_viewport = self.logicalViewportPoint(
+                self.posToViewport(pos.x, pos.y),
+            );
             const pin = screen.pages.pin(.{
                 .viewport = .{
                     .x = pt_viewport.x,
@@ -6116,7 +6316,7 @@ fn maybePromptClick(self: *Surface) !bool {
 
     // Get the pin for our mouse click.
     const pos = try self.rt_surface.getCursorPos();
-    const pos_vp = self.posToViewport(pos.x, pos.y);
+    const pos_vp = self.logicalViewportPoint(self.posToViewport(pos.x, pos.y));
     const click_pin: terminal.Pin = pin: {
         const pin = screen.pages.pin(.{
             .viewport = .{
@@ -6210,6 +6410,339 @@ fn maybePromptClick(self: *Surface) !bool {
 
     return true;
 }
+
+/// A Shift+arrow request to grow or shrink the selection at the prompt.
+const PromptSelectionMove = struct {
+    dir: terminal.Screen.PromptStep,
+    word: bool,
+};
+
+/// Map a SCREEN arrow direction to a logical direction through the command
+/// line.
+///
+/// The arrows name a direction on screen, while the selection walks the
+/// command line in logical order, and on a right-to-left row those are
+/// opposites: the next character of a Hebrew command line is drawn further
+/// LEFT. So Shift+Left extends forward there, and Shift+Right extends back.
+///
+/// This is the same rule the fork already applies to plain arrow keys via
+/// `bidi_swap_arrows`, kept in agreement deliberately: selecting with Shift
+/// held has to walk the text in the same direction that releasing Shift and
+/// pressing the same arrow would move the cursor.
+fn promptSelectionMoveFor(
+    visual_left: bool,
+    word: bool,
+    rtl: bool,
+) PromptSelectionMove {
+    const backward = if (rtl) !visual_left else visual_left;
+    return .{
+        .dir = if (backward) .backward else .forward,
+        .word = word,
+    };
+}
+
+/// Extend or shrink the selection at the prompt with Shift+arrow.
+///
+/// The terminal owns the selection, so this never reaches the shell: the
+/// selection is grown here and the key is consumed. What makes that useful is
+/// that `maybePromptSelectionEdit` then treats the result exactly like a
+/// mouse selection, so typing replaces it and delete removes it.
+///
+/// Returns true if the key was handled.
+fn maybePromptSelectionMove(self: *Surface, event: input.KeyEvent) !bool {
+    if (!self.config.selection_edit_at_prompt) return false;
+
+    // Cheap reject before taking the lock: most keys are not Shift+arrow.
+    switch (event.action) {
+        .press, .repeat => {},
+        .release => return false,
+    }
+    {
+        const mods = event.mods.binding();
+        if (!mods.shift) return false;
+        if (mods.ctrl or mods.super) return false;
+        switch (event.key) {
+            .arrow_left, .arrow_right => {},
+            else => return false,
+        }
+    }
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    return self.promptSelectionExtendLocked(
+        event.key == .arrow_left,
+        event.mods.binding().alt,
+    );
+}
+
+/// Extend or shrink the prompt selection for an arrow pressed with Shift.
+///
+/// `visual_left` names the direction on SCREEN; the logical direction is
+/// derived from the row. Split out from the key handler because Shift+arrow
+/// also arrives as the `adjust_selection` keybinding, and both entry points
+/// have to behave identically.
+///
+/// Requires the renderer state mutex is held.
+fn promptSelectionExtendLocked(
+    self: *Surface,
+    visual_left: bool,
+    word: bool,
+) !bool {
+    if (!self.config.selection_edit_at_prompt) return false;
+
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    const screen: *terminal.Screen = t.screens.active;
+
+    // Only at a prompt, on input. An application that has taken over the
+    // screen wants the raw Shift+arrow, and many use it.
+    if (!t.cursorIsAtPrompt()) return false;
+    if (screen.cursor.semantic_content != .input and
+        screen.cursor.page_cell.semantic_content != .input) return false;
+
+    const move = promptSelectionMoveFor(
+        visual_left,
+        word,
+        self.cursorRowIsRtl(),
+    );
+
+    // The head is the end that moves; the anchor stays put.
+    const cursor_pin = screen.cursor.page_pin.*;
+
+    const anchor, const from = if (screen.selection) |sel|
+        .{ sel.start(), sel.end() }
+    else anchor: {
+        // A fresh selection. The caret sits at the LEFT EDGE of the cursor
+        // cell, not on the cell, so which cell the selection starts from
+        // depends on which way it grows:
+        //
+        //   forward  - the cursor cell is the first thing selected
+        //   backward - the cursor cell is past the caret and must NOT be
+        //              selected; the cell before it is the first
+        //
+        // Getting this wrong is what made a backward selection swallow the
+        // space the cursor was parked on.
+        const first = switch (move.dir) {
+            .forward => cursor_pin,
+            .backward => screen.promptInputStep(cursor_pin, .backward) orelse
+                return true,
+        };
+
+        // The anchor is that cell, whatever it holds. A caret parked just
+        // after a space anchors ON the space, so selecting the word before it
+        // takes the separator too, which is what reads correctly when you are
+        // about to type over the result.
+        break :anchor .{ first, first };
+    };
+
+    // A fresh non-word selection is just the anchor cell itself.
+    if (screen.selection == null and !move.word) {
+        try self.setSelection(.init(anchor, anchor, false));
+        return true;
+    }
+
+    const start = if (screen.selection == null) anchor else from;
+    const next = if (move.word)
+        screen.promptInputStepWord(start, move.dir)
+    else
+        screen.promptInputStep(start, move.dir);
+
+    // Already at the end of the input. Consume the key anyway: letting it
+    // through would move the shell's cursor out from under a live selection.
+    const new_head = next orelse if (screen.selection == null)
+        anchor
+    else
+        return true;
+
+    // Stepping back onto the anchor means the selection is empty again.
+    if (new_head.eql(anchor) and screen.selection != null) {
+        try self.setSelection(null);
+        return true;
+    }
+
+    try self.setSelection(.init(anchor, new_head, false));
+    return true;
+}
+
+/// What a key press should do about an active prompt selection.
+pub const PromptSelectionEdit = enum {
+    /// Nothing happened. Encode the key normally.
+    none,
+
+    /// The selection was deleted and the key should still be encoded, so it
+    /// lands as an insert where the selection used to be.
+    replaced,
+
+    /// The selection was deleted and the key must NOT be encoded, because
+    /// deleting the selection *is* what the key asked for.
+    deleted,
+};
+
+/// `Terminal.cursorIsAtPrompt` without its alternate-screen veto.
+///
+/// That veto reads "an application owning the screen owns its own editing",
+/// and for an application that draws a composer silently it is still right:
+/// nothing here could find its input positions, so there is nothing to count
+/// arrows or deletes against.
+///
+/// But OSC 133 is recorded against whichever screen is active, so an
+/// application that marks its input with `B` is telling us exactly where those
+/// positions are, and the same arrow-and-delete emulation applies to it. Gate
+/// on the marking, not on which screen happens to be up. An application that
+/// emits no marks is refused either way, one guard later, because no cell of
+/// its composer is `.input`.
+///
+/// Every other condition in `maybePromptSelectionEdit` is unchanged, so on the
+/// primary screen this accepts exactly what it accepted before.
+fn cursorIsAtPromptInput(t: *terminal.Terminal) bool {
+    const cursor: *const terminal.Screen.Cursor = &t.screens.active.cursor;
+    if (cursor.page_row.semantic_prompt != .none) return true;
+    return switch (cursor.semantic_content) {
+        .input, .prompt => true,
+        .output => false,
+    };
+}
+
+/// Classify a key press for `maybePromptSelectionEdit`. Pure; no terminal
+/// state is consulted, so this can run before taking the renderer lock.
+fn promptSelectionEditIntent(event: input.KeyEvent) PromptSelectionEdit {
+    // Repeats count: holding backspace over a selection should delete it on
+    // the first repeat and then behave normally once it is gone.
+    switch (event.action) {
+        .press, .repeat => {},
+        .release => return .none,
+    }
+
+    // Anything with a control-ish modifier is a command (kill-line, word
+    // motion, a keybind), not text entry. Shift is fine: it makes capitals.
+    const mods = event.mods.binding();
+    if (mods.ctrl or mods.alt or mods.super) return .none;
+
+    switch (event.key) {
+        .backspace, .delete => return .deleted,
+        else => {},
+    }
+
+    // Text entry only. `utf8` is empty for keys that produce no text, and we
+    // reject C0 so enter/tab/escape keep their normal meaning.
+    if (event.utf8.len == 0) return .none;
+    for (event.utf8) |b| if (b < 0x20 or b == 0x7F) return .none;
+
+    return .replaced;
+}
+
+/// Make a selection at a prompt behave like a selection in a text editor:
+/// typing over it replaces it, backspace and delete remove it.
+///
+/// The terminal cannot ask the shell to do this; nothing in the protocol
+/// expresses "replace the selection", and the shell does not know a selection
+/// exists. So we emulate it with the same mechanism `maybePromptClick` uses:
+/// arrow keys to move the cursor to the start of the selection, then one
+/// forward delete per selected position. The caller then encodes the original
+/// key, which inserts at the now-empty spot.
+///
+/// Returns `.none` and touches nothing unless the selection lies entirely
+/// within the current prompt's input.
+fn maybePromptSelectionEdit(self: *Surface, event: input.KeyEvent) !PromptSelectionEdit {
+    if (!self.config.selection_edit_at_prompt) return .none;
+
+    const intent = promptSelectionEditIntent(event);
+    if (intent == .none) return .none;
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    const screen: *terminal.Screen = t.screens.active;
+
+    // Note what is deliberately NOT required here: the `cl` / `click_events`
+    // click option. We place the cursor with arrow keys rather than asking
+    // the shell to resolve a click, so all this needs is OSC 133 `B` input
+    // marking. That makes it work on shells that mark input but advertise no
+    // click support, and on shells that advertise click support they do not
+    // honor (fish 4 advertises `click_events=1`, then ignores the injected
+    // event while responding to arrow keys normally).
+
+    // Only at a prompt, where "prompt" means marked input rather than a
+    // particular screen. See `cursorIsAtPromptInput`.
+    if (!cursorIsAtPromptInput(t)) return .none;
+
+    // The cursor must be sitting on input, because the arrow count is
+    // measured from it. `promptLineMove` reports no movement both when it
+    // succeeds trivially and when it cannot move at all, and deleting on the
+    // second would delete from wherever the cursor happens to be.
+    if (screen.cursor.semantic_content != .input and
+        screen.cursor.page_cell.semantic_content != .input) return .none;
+
+    const sel = screen.selection orelse return .none;
+
+    // A rectangle selection is not a run of input positions.
+    if (sel.rectangle) return .none;
+
+    // Right-to-left rows used to be refused here, because the mouse turned a
+    // screen column straight into a logical cell and so did not name the run
+    // the user dragged over. `logicalViewportPoint` now inverts the row's bidi
+    // order on the way in, so both mouse and keyboard selections carry
+    // endpoints that mean what they say.
+
+    const tl = sel.topLeft(screen);
+    const br = sel.bottomRight(screen);
+
+    // Both ends must be input. This is what keeps command output, the prompt
+    // text itself, and earlier scrollback copy-only.
+    if (tl.rowAndCell().cell.semantic_content != .input) return .none;
+    if (br.rowAndCell().cell.semantic_content != .input) return .none;
+
+    // The selection must belong to the prompt the cursor is sitting in, not
+    // an older one still on screen.
+    const prompt_pin: terminal.Pin = prompt_pin: {
+        var it = screen.cursor.page_pin.promptIterator(.left_up, null);
+        break :prompt_pin it.next() orelse return .none;
+    };
+    if (tl.before(prompt_pin)) return .none;
+
+    const count = screen.promptInputCellCount(tl, br);
+    if (count == 0) return .none;
+
+    // A command line long enough to blow past this is not something we
+    // should be driving one keystroke at a time.
+    if (count > max_prompt_selection_edit) return .none;
+
+    const move = screen.promptLineMove(tl);
+
+    const left_arrow = if (t.modes.get(.cursor_keys)) "\x1bOD" else "\x1b[D";
+    const right_arrow = if (t.modes.get(.cursor_keys)) "\x1bOC" else "\x1b[C";
+    const forward_delete = "\x1b[3~";
+
+    // Build one write. Queuing per keystroke would put hundreds of messages
+    // on the IO thread for a long selection and let the shell redraw between
+    // them.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(self.alloc);
+    try buf.ensureTotalCapacity(
+        self.alloc,
+        (move.left + move.right) * 3 + count * forward_delete.len,
+    );
+    for (0..move.left) |_| buf.appendSliceAssumeCapacity(left_arrow);
+    for (0..move.right) |_| buf.appendSliceAssumeCapacity(right_arrow);
+    for (0..count) |_| buf.appendSliceAssumeCapacity(forward_delete);
+
+    self.queueIo(
+        try termio.Message.writeReq(self.alloc, buf.items),
+        .locked,
+    );
+
+    // The text it referred to is gone, so the selection has to go with it
+    // regardless of `selection-clear-on-typing`.
+    try self.setSelection(null);
+
+    return intent;
+}
+
+/// Upper bound on positions we will delete for one prompt selection edit.
+/// Generous next to any real command line, small enough that a corrupt
+/// screen state cannot turn one keystroke into an unbounded write.
+const max_prompt_selection_edit: usize = 10_000;
 
 const Link = struct {
     action: input.Link.Action,
@@ -6374,7 +6907,7 @@ fn linkAtPos(
     // Convert our cursor position to a screen point.
     const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
     const mouse_pin: terminal.Pin = mouse_pin: {
-        const point = self.posToViewport(pos.x, pos.y);
+        const point = self.logicalViewportPoint(self.posToViewport(pos.x, pos.y));
         const pin = screen.pages.pin(.{ .viewport = point }) orelse {
             log.warn("failed to get pin for clicked point", .{});
             return null;
@@ -6782,13 +7315,13 @@ pub fn cursorPosCallback(
         // All roads lead to requiring a re-render at this point.
         try self.queueRender();
 
-        // Convert to points
+        // Convert to points. This is the end of the selection that follows
+        // the pointer, so like the press it has to name a logical cell; a
+        // drag that mixed a logical anchor with a visual head selected a
+        // mirrored run on a right-to-left row.
         const screen: *terminal.Screen = t.screens.active;
         const pin = screen.pages.pin(.{
-            .viewport = .{
-                .x = pos_vp.x,
-                .y = pos_vp.y,
-            },
+            .viewport = self.logicalViewportPoint(pos_vp),
         }) orelse {
             if (comptime std.debug.runtime_safety) unreachable;
             return;
@@ -7734,6 +8267,22 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .adjust_selection => |direction| {
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
+
+            // Shift+Left/Right is bound to this action by default, so at a
+            // prompt it has to mean "grow the selection through the command
+            // line", not the screen-space adjustment below. Without this the
+            // binding swallows the key before the prompt handler ever sees
+            // it, which left plain Shift+arrow doing nothing useful while
+            // Shift+Option+arrow, which has no binding, worked fine.
+            switch (direction) {
+                .left, .right => {
+                    if (try self.promptSelectionExtendLocked(
+                        direction == .left,
+                        false,
+                    )) return true;
+                },
+                else => {},
+            }
 
             const screen: *terminal.Screen = self.io.terminal.screens.active;
             const sel = screen.adjustSelection(switch (direction) {
@@ -10034,4 +10583,203 @@ test "Surface: oversized soft-wrapped URL candidate is rejected" {
             null,
         )) == null);
     }
+}
+
+test "Surface: prompt selection edit intent classifies typing and deletion" {
+    const testing = std.testing;
+
+    // Plain text replaces the selection, and the key still gets encoded.
+    try testing.expectEqual(PromptSelectionEdit.replaced, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .key_a,
+        .utf8 = "a",
+    }));
+
+    // Shift is text entry too.
+    try testing.expectEqual(PromptSelectionEdit.replaced, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .key_a,
+        .mods = .{ .shift = true },
+        .utf8 = "A",
+    }));
+
+    // Backspace and delete consume the key: removing the selection is the
+    // entire request, so the key must not also reach the shell.
+    try testing.expectEqual(PromptSelectionEdit.deleted, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .backspace,
+    }));
+    try testing.expectEqual(PromptSelectionEdit.deleted, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .delete,
+    }));
+
+    // Held backspace still deletes the selection on the first repeat.
+    try testing.expectEqual(PromptSelectionEdit.deleted, promptSelectionEditIntent(.{
+        .action = .repeat,
+        .key = .backspace,
+    }));
+}
+
+test "Surface: prompt selection edit intent leaves commands alone" {
+    const testing = std.testing;
+
+    // Releases never edit.
+    try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+        .action = .release,
+        .key = .key_a,
+        .utf8 = "a",
+    }));
+
+    // Control-ish modifiers mean a command or a keybind, not text.
+    for ([_]input.Mods{
+        .{ .ctrl = true },
+        .{ .alt = true },
+        .{ .super = true },
+    }) |mods| {
+        try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+            .action = .press,
+            .key = .key_a,
+            .mods = mods,
+            .utf8 = "a",
+        }));
+        // ...including on backspace, where ctrl/alt mean kill-word.
+        try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+            .action = .press,
+            .key = .backspace,
+            .mods = mods,
+        }));
+    }
+
+    // Keys that produce no text (arrows, modifiers) do nothing.
+    try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .arrow_left,
+    }));
+
+    // Enter, tab and escape keep their own meaning rather than replacing.
+    try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .enter,
+        .utf8 = "\r",
+    }));
+    try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .tab,
+        .utf8 = "\t",
+    }));
+    try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .escape,
+        .utf8 = "\x1b",
+    }));
+}
+
+test "Surface: shift+arrow direction maps by row direction" {
+    const testing = std.testing;
+
+    // LTR: Left walks back through the command line, Right walks ahead.
+    try testing.expectEqual(
+        terminal.Screen.PromptStep.backward,
+        promptSelectionMoveFor(true, false, false).dir,
+    );
+    try testing.expectEqual(
+        terminal.Screen.PromptStep.forward,
+        promptSelectionMoveFor(false, false, false).dir,
+    );
+
+    // RTL: the same keys mean the opposite logical direction, because the
+    // next character of a Hebrew line is drawn further left.
+    try testing.expectEqual(
+        terminal.Screen.PromptStep.forward,
+        promptSelectionMoveFor(true, false, true).dir,
+    );
+    try testing.expectEqual(
+        terminal.Screen.PromptStep.backward,
+        promptSelectionMoveFor(false, false, true).dir,
+    );
+}
+
+test "Surface: shift+arrow word flag is independent of direction" {
+    const testing = std.testing;
+
+    // Word-wise flips with the row exactly like the character form, so the
+    // two cannot disagree about which way "forward" is.
+    for ([_]bool{ false, true }) |rtl| {
+        for ([_]bool{ false, true }) |left| {
+            const plain = promptSelectionMoveFor(left, false, rtl);
+            const word = promptSelectionMoveFor(left, true, rtl);
+            try testing.expectEqual(plain.dir, word.dir);
+            try testing.expect(!plain.word);
+            try testing.expect(word.word);
+        }
+    }
+}
+
+test "Surface: prompt input gate accepts a marking application on the alternate screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // An application takes the screen and marks its composer's input, the way
+    // a shell marks a command line. That marking is the whole basis for
+    // counting arrows and deletes, so it is enough to qualify.
+    try t.switchScreenMode(.@"1049", true);
+    try testing.expect(!cursorIsAtPromptInput(&t));
+
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try testing.expect(cursorIsAtPromptInput(&t));
+
+    // `Terminal.cursorIsAtPrompt` still refuses here. This function exists
+    // precisely to differ from it on this case.
+    try testing.expect(!t.cursorIsAtPrompt());
+}
+
+test "Surface: prompt input gate refuses an unmarked application" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // The overwhelmingly common case: a full-screen application that draws a
+    // composer as ordinary output and emits no OSC 133. Nothing here can find
+    // its input positions, so it must stay copy-only.
+    try t.switchScreenMode(.@"1049", true);
+    for ("> type here") |c| try t.print(c);
+
+    try testing.expect(!cursorIsAtPromptInput(&t));
+}
+
+test "Surface: prompt input gate matches cursorIsAtPrompt on the primary screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // Walking a whole prompt lifecycle: relaxing the screen check must not
+    // change a single verdict while the primary screen is up.
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
+
+    try t.semanticPrompt(.init(.prompt_start));
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
+    for ("$ ") |c| try t.print(c);
+
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
+    for ("ls") |c| try t.print(c);
+
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
+
+    try t.linefeed();
+    try testing.expect(!t.cursorIsAtPrompt());
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
+
+    try t.linefeed();
+    try t.semanticPrompt(.init(.prompt_start));
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
 }

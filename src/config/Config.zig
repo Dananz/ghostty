@@ -372,6 +372,22 @@ language: ?[:0]const u8 = null,
 /// Available since: 1.2.0
 @"font-shaping-break": FontShapingBreak = .{},
 
+/// Enable bidirectional (RTL/Hebrew/Arabic) text rendering. Experimental
+/// (Milestone 1: rendering only; cursor and selection in mixed text are not
+/// yet bidi-aware). Defaults to false.
+bidi: bool = false,
+
+/// Base paragraph direction for bidi rendering (only applies when `bidi` is
+/// true). This is a user-controlled toggle, not derived from content.
+///
+///   * `ltr` - Left-anchored (Latin terminal). Lines stay pinned to the left
+///     edge; RTL runs still reverse internally so words read correctly.
+///   * `rtl` - Right-anchored mirror (Hebrew/Arabic terminal). The line is
+///     mirrored to the right edge and reads right-to-left.
+///
+/// Defaults to `ltr`.
+@"bidi-direction": BidiDirection = .ltr,
+
 /// What color space to use when performing alpha blending.
 ///
 /// This affects the appearance of text and of any images with transparency.
@@ -913,6 +929,58 @@ palette: Palette = .{},
 /// a click event directly to the shell. In either case, some unexpected
 /// behavior around edge cases is possible.
 @"cursor-click-to-move": bool = true,
+
+/// Hide the cursor while text is selected, the way a text editor hides its
+/// caret during a selection.
+///
+/// With `selection-edit-at-prompt` on, the selection is what the next
+/// keystroke acts on, so a cursor drawn inside the highlight is actively
+/// misleading about where typing will land.
+///
+/// The cursor returns as soon as the selection is cleared. Preedit and
+/// password-input states still show their cursor, since those are things you
+/// need to see even mid-selection.
+@"cursor-hide-while-selecting": bool = true,
+
+/// Mirror horizontal arrows drawn on a right-to-left row.
+///
+/// Only meaningful with `bidi-direction = rtl`, which also mirrors the arrow
+/// KEYS on those rows: pressing the arrow that points along the reading
+/// direction moves back. An application's own hint, such as `press <-`, sits
+/// in a Latin run, so UAX #9 leaves the glyph alone and it ends up naming the
+/// opposite of the key that performs it.
+///
+/// This mirrors the glyph so the hint and the key agree. It is a deliberate
+/// deviation from UAX #9 rule L4, and it applies to arrows in left-to-right
+/// text too, so an arrow meaning direction rather than a keystroke (a diagram,
+/// `a -> b` in prose) also flips on those rows. Turn this off to follow the
+/// standard exactly.
+@"bidi-mirror-arrows": bool = true,
+
+/// Lets a selection made at a prompt behave like a selection in a text
+/// editor: typing replaces it, and backspace or delete removes it.
+///
+/// A terminal has no protocol for this. The selection lives entirely in the
+/// terminal and the shell has never heard of it, so this is emulated: the
+/// terminal moves the cursor to the start of the selection with arrow keys,
+/// deletes the selected positions, and then lets your keystroke through.
+///
+/// This needs `OSC 133` shell integration, specifically the `B` mark that
+/// says where input begins, so the terminal can tell your command line apart
+/// from the prompt around it. It does NOT need the `cl` or `click_events`
+/// click option that `cursor-click-to-move` uses: the cursor is placed with
+/// arrow keys, which every line editor understands, rather than by asking the
+/// shell to resolve a click.
+///
+/// It only applies to a selection lying entirely inside the current prompt's
+/// input. Selections in command output stay copy-only.
+///
+/// The `B` mark, not the screen, is what decides this. A full-screen
+/// application that marks its input is edited the same way a shell prompt is;
+/// one that does not, which is nearly all of them today, is untouched, because
+/// no cell of the composer it drew is input. So an application that implements
+/// its own editing keeps it.
+@"selection-edit-at-prompt": bool = true,
 
 /// Hide the mouse immediately when typing. The mouse becomes visible again
 /// when the mouse is used (button, movement, etc.). Platform-specific behavior
@@ -8700,6 +8768,15 @@ pub const RepeatableLink = struct {
     }
 };
 
+/// See `bidi-direction`.
+pub const BidiDirection = enum {
+    /// Left-anchored (Latin terminal); lines stay pinned to the left edge.
+    ltr,
+    /// Right-anchored mirror (Hebrew/Arabic terminal); the line reads
+    /// right-to-left and is pinned to the right edge.
+    rtl,
+};
+
 /// Options for copy on select behavior.
 pub const CopyOnSelect = enum {
     /// Disables copy on select entirely.
@@ -10432,6 +10509,13 @@ test "parse hook: invalid command" {
     var it: TestIterator = .{ .data = &.{"foo"} };
     try testing.expect(try cfg.parseManuallyHook(alloc, "--command", &it));
     try testing.expect(cfg.command == null);
+}
+
+test "bidi config defaults to false" {
+    const testing = std.testing;
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+    try testing.expectEqual(false, cfg.bidi);
 }
 
 test "parse e: command only" {

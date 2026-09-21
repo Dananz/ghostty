@@ -3625,8 +3625,12 @@ fn promptClickLine(self: *Screen, click_pin: Pin) PromptClickMove {
                 // areas.
                 if (cell.semantic_content != .input) continue;
 
-                // Increment our input count
-                count += 1;
+                // Increment our input count. A wide character covers two
+                // cells but is a single position to the shell, so its
+                // spacer must not earn its own arrow key. We still let the
+                // spacer match the target below, so clicking either half
+                // of a wide character lands in the same place.
+                if (!cell.wide.spacer()) count += 1;
 
                 // If this is our target, we're done.
                 if (row_pin.node == click_pin.node and
@@ -3683,8 +3687,9 @@ fn promptClickLine(self: *Screen, click_pin: Pin) PromptClickMove {
             // Ignore non-input cells.
             if (cell.semantic_content != .input) continue;
 
-            // Increment our input count
-            count += 1;
+            // Increment our input count, skipping wide-character spacers
+            // which are not separate positions to the shell.
+            if (!cell.wide.spacer()) count += 1;
 
             // If this is our target, we're done.
             if (row_pin.node == click_pin.node and
@@ -3698,6 +3703,141 @@ fn promptClickLine(self: *Screen, click_pin: Pin) PromptClickMove {
     }
 
     return .{ .left = count, .right = 0 };
+}
+
+/// Like `promptClickMove`, but always computes line-based arrow motion no
+/// matter what the shell advertised for click handling.
+///
+/// `promptClickMove` hands `click_events` shells back zero movement on
+/// purpose: for a click it is better to let the shell resolve the position
+/// itself. That is the wrong answer for a caller that needs to know where the
+/// cursor ended up, such as a ranged delete, and a shell can advertise click
+/// handling that it does not actually apply (fish 4 advertises
+/// `click_events=1` but ignores the event when it is injected, while
+/// responding to arrow keys normally).
+///
+/// Arrow keys are understood by every line editor, so this is the portable
+/// way to place the cursor when the terminal must stay in control.
+///
+/// The caller must have already established that the cursor is on an input
+/// cell; as with `promptClickMove`, zero movement here is ambiguous between
+/// "already there" and "cannot move".
+pub fn promptLineMove(self: *Screen, target: Pin) PromptClickMove {
+    return self.promptClickLine(target);
+}
+
+/// Direction of travel through a prompt's editable positions, in LOGICAL
+/// terms. `forward` is toward the end of the command line, whichever side of
+/// the screen that lands on for a right-to-left row.
+pub const PromptStep = enum { backward, forward };
+
+/// Step one editable position through the prompt's input, skipping prompt
+/// text, padding and wide-character spacers, and following soft wraps.
+///
+/// Returns null at the ends of the input, which is the caller's cue that a
+/// selection cannot extend further.
+pub fn promptInputStep(
+    self: *const Screen,
+    from: Pin,
+    dir: PromptStep,
+) ?Pin {
+    var it = switch (dir) {
+        .forward => from.cellIterator(.right_down, null),
+        .backward => from.cellIterator(.left_up, null),
+    };
+
+    // The iterator yields `from` itself first.
+    _ = it.next();
+
+    while (it.next()) |pin| {
+        const cell = pin.rowAndCell().cell;
+
+        // Leaving the input ends the walk. Trailing blanks on the row are
+        // not input, so this also stops at the end of what was typed.
+        if (cell.semantic_content != .input) return null;
+
+        // A wide character's spacer is the same position as its head.
+        if (cell.wide.spacer()) continue;
+
+        return pin;
+    }
+
+    _ = self;
+    return null;
+}
+
+/// Step one word through the prompt's input.
+///
+/// Word here means what a line editor means by it: skip any run of spaces,
+/// then cross the run of non-spaces beyond it. Landing rule differs by
+/// direction so that repeated steps march evenly, matching the behaviour of
+/// word-wise motion in a text editor.
+pub fn promptInputStepWord(
+    self: *const Screen,
+    from: Pin,
+    dir: PromptStep,
+) ?Pin {
+    const isSpace = struct {
+        fn f(p: Pin) bool {
+            const cell = p.rowAndCell().cell;
+            if (!cell.hasText()) return true;
+            const cp = cell.codepoint();
+            return cp == ' ' or cp == '\t';
+        }
+    }.f;
+
+    var cur = self.promptInputStep(from, dir) orelse return null;
+
+    // Skip the run of spaces between us and the next word.
+    while (isSpace(cur)) {
+        cur = self.promptInputStep(cur, dir) orelse return cur;
+    }
+
+    // Cross the word itself, stopping on its far edge. Always the last
+    // character of the word, never the separator past it: a word selection
+    // should contain the word and nothing else.
+    while (true) {
+        const next = self.promptInputStep(cur, dir) orelse return cur;
+        if (isSpace(next)) return cur;
+        cur = next;
+    }
+}
+
+/// Count the editable positions covered by the inclusive cell range
+/// [start, end].
+///
+/// This uses the same accounting as `promptClickMove`: only OSC 133 input
+/// cells count, and a wide character's spacer is not its own position. So a
+/// count returned here is directly comparable to the arrow-key counts that
+/// function produces, which is what lets a caller move the cursor to `start`
+/// and then delete exactly this many positions.
+///
+/// Returns 0 if `end` is before `start`.
+pub fn promptInputCellCount(self: *const Screen, start: Pin, end: Pin) usize {
+    _ = self;
+    if (end.before(start)) return 0;
+
+    var count: usize = 0;
+    var row_it = start.rowIterator(.right_down, end);
+    while (row_it.next()) |row_pin| {
+        const rac = row_pin.rowAndCell();
+        const cells = row_pin.node.page().getCells(rac.row);
+
+        // Clamp to the range on the first and last rows; full rows between.
+        const from: usize = if (row_pin.node == start.node and
+            row_pin.y == start.y) start.x else 0;
+        const to: usize = if (row_pin.node == end.node and
+            row_pin.y == end.y) @min(end.x + 1, cells.len) else cells.len;
+        if (from >= to) continue;
+
+        for (cells[from..to]) |cell| {
+            if (cell.semantic_content != .input) continue;
+            if (cell.wide.spacer()) continue;
+            count += 1;
+        }
+    }
+
+    return count;
 }
 
 /// Dump the screen to a string. The writer given should be buffered;
@@ -12434,4 +12574,178 @@ test "Screen: promptClickMove click right of input cursor on last char" {
 
     try testing.expectEqual(@as(usize, 1), result.right);
     try testing.expectEqual(@as(usize, 0), result.left);
+}
+
+test "Screen: promptInputCellCount counts an inclusive input range" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    // "ell" -> columns 3..5 inclusive.
+    const start = s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?;
+    const end = s.pages.pin(.{ .active = .{ .x = 5, .y = 0 } }).?;
+    try testing.expectEqual(@as(usize, 3), s.promptInputCellCount(start, end));
+
+    // A single cell is one position.
+    try testing.expectEqual(@as(usize, 1), s.promptInputCellCount(start, start));
+}
+
+test "Screen: promptInputCellCount skips the prompt itself" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hi");
+
+    // Span the whole row: only the two input cells count, not "> ".
+    const start = s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    const end = s.pages.pin(.{ .active = .{ .x = 19, .y = 0 } }).?;
+    try testing.expectEqual(@as(usize, 2), s.promptInputCellCount(start, end));
+}
+
+test "Screen: promptInputCellCount counts a wide character once" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    // Two wide characters occupy four cells but are two positions to a shell.
+    try s.testWriteString("你好");
+
+    const start = s.pages.pin(.{ .active = .{ .x = 2, .y = 0 } }).?;
+    const end = s.pages.pin(.{ .active = .{ .x = 5, .y = 0 } }).?;
+    try testing.expectEqual(@as(usize, 2), s.promptInputCellCount(start, end));
+}
+
+test "Screen: promptInputCellCount returns zero for a reversed range" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    const start = s.pages.pin(.{ .active = .{ .x = 4, .y = 0 } }).?;
+    const end = s.pages.pin(.{ .active = .{ .x = 1, .y = 0 } }).?;
+    try testing.expectEqual(@as(usize, 0), s.promptInputCellCount(start, end));
+}
+
+test "Screen: promptClickMove does not give a wide character two arrows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.semantic_prompt.click = .{ .cl = .line };
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    // "你" spans columns 2-3, "好" spans 4-5, then "a" at 6.
+    try s.testWriteString("你好a");
+
+    // Park the cursor on the first wide character.
+    s.cursorAbsolute(2, 0);
+
+    // Reaching "a" crosses two wide characters, which is two shell
+    // positions, not the four cells they cover.
+    const click_pin = s.pages.pin(.{ .active = .{ .x = 6, .y = 0 } }).?;
+    const result = s.promptClickMove(click_pin);
+    try testing.expectEqual(@as(usize, 2), result.right);
+    try testing.expectEqual(@as(usize, 0), result.left);
+}
+
+test "Screen: promptLineMove works when the shell advertised click_events" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // fish 4 advertises this, and promptClickMove deliberately returns zero
+    // for it so the shell can resolve clicks itself. Selection editing has to
+    // drive the cursor regardless, so promptLineMove must still answer.
+    s.semantic_prompt.click = .{ .click_events = .absolute };
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    s.cursorAbsolute(2, 0);
+    const target = s.pages.pin(.{ .active = .{ .x = 4, .y = 0 } }).?;
+
+    try testing.expectEqual(PromptClickMove.zero, s.promptClickMove(target));
+
+    const move = s.promptLineMove(target);
+    try testing.expectEqual(@as(usize, 2), move.right);
+    try testing.expectEqual(@as(usize, 0), move.left);
+}
+
+test "Screen: promptLineMove counts leftward too" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.semantic_prompt.click = .{ .click_events = .absolute };
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    // Cursor past the end, target the 'e'.
+    s.cursorAbsolute(6, 0);
+    const target = s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?;
+
+    const move = s.promptLineMove(target);
+    try testing.expectEqual(@as(usize, 0), move.right);
+    try testing.expectEqual(@as(usize, 3), move.left);
+}
+
+test "Screen: promptInputStepWord stops on the word, not the separator" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 40, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    //                    col: 2345678901234
+    try s.testWriteString("da asd asda");
+
+    // Backward from the final 'a' of "asda" lands on the 'a' that starts it,
+    // never on the space before it.
+    const from = s.pages.pin(.{ .active = .{ .x = 12, .y = 0 } }).?;
+    const back = s.promptInputStepWord(from, .backward).?;
+    try testing.expectEqual(@as(usize, 9), back.x);
+
+    // Forward from the 'd' of "da" lands on the last letter of "asd",
+    // not on the space that follows it.
+    const from2 = s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?;
+    const fwd = s.promptInputStepWord(from2, .forward).?;
+    try testing.expectEqual(@as(usize, 7), fwd.x);
 }
