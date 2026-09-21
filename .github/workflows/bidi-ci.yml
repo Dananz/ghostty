@@ -47,7 +47,18 @@ jobs:
       # signing step (CI can't satisfy it). Universal so colleagues on Intel or
       # Apple Silicon both work.
       - name: Build GhosttyKit xcframework (shaper + renderer)
-        run: zig build -Demit-xcframework=true -Demit-macos-app=false -Dxcframework-target=universal -Doptimize=ReleaseFast
+        run: |
+          # Same flags as cmux's own build-ghosttykit.yml, so the artifact
+          # matches the "ghostty build key" ensure-ghosttykit.sh computes
+          # (<sha>-crashsubdir-cmux-crash-sentry-off-noi18n-v2).
+          zig build \
+            -Dcrash-report-subdir="cmux/crash" \
+            -Dsentry=false \
+            -Di18n=false \
+            -Demit-xcframework=true \
+            -Demit-macos-app=false \
+            -Dxcframework-target=universal \
+            -Doptimize=ReleaseFast
       - name: Run bidi + shaper unit tests
         run: zig build test -Dtest-filter=bidi
       - name: Locate + package GhosttyKit.xcframework
