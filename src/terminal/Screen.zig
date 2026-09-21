@@ -12580,7 +12580,7 @@ test "Screen: promptInputCellCount counts an inclusive input range" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    var s = try init(testing.io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
     defer s.deinit();
 
     s.cursorSetSemanticContent(.{ .prompt = .initial });
@@ -12601,7 +12601,7 @@ test "Screen: promptInputCellCount skips the prompt itself" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    var s = try init(testing.io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
     defer s.deinit();
 
     s.cursorSetSemanticContent(.{ .prompt = .initial });
@@ -12619,7 +12619,7 @@ test "Screen: promptInputCellCount counts a wide character once" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    var s = try init(testing.io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
     defer s.deinit();
 
     s.cursorSetSemanticContent(.{ .prompt = .initial });
@@ -12637,7 +12637,7 @@ test "Screen: promptInputCellCount returns zero for a reversed range" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    var s = try init(testing.io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
     defer s.deinit();
 
     s.cursorSetSemanticContent(.{ .input = .clear_explicit });
@@ -12652,7 +12652,7 @@ test "Screen: promptClickMove does not give a wide character two arrows" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    var s = try init(testing.io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
     defer s.deinit();
 
     s.semantic_prompt.click = .{ .cl = .line };
@@ -12678,7 +12678,7 @@ test "Screen: promptLineMove works when the shell advertised click_events" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    var s = try init(testing.io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
     defer s.deinit();
 
     // fish 4 advertises this, and promptClickMove deliberately returns zero
@@ -12705,7 +12705,7 @@ test "Screen: promptLineMove counts leftward too" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    var s = try init(testing.io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
     defer s.deinit();
 
     s.semantic_prompt.click = .{ .click_events = .absolute };
@@ -12728,7 +12728,7 @@ test "Screen: promptInputStepWord stops on the word, not the separator" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var s = try init(alloc, .{ .cols = 40, .rows = 5, .max_scrollback = 0 });
+    var s = try init(testing.io, alloc, .{ .cols = 40, .rows = 5, .max_scrollback = 0 });
     defer s.deinit();
 
     s.cursorSetSemanticContent(.{ .prompt = .initial });
