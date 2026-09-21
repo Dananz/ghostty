@@ -1,27 +1,27 @@
 name: bidi-ci
 
-# Fork-friendly CI using GitHub-hosted runners (macos-14 ships an SDK that
-# zig 0.15.2 can link, unlike the macOS 26 SDK on local dev machines).
+# Fork-friendly CI using GitHub-hosted runners. Upstream moved ghostty to Zig
+# 0.16.0, which links the current macOS SDKs, so no SDK pinning is needed.
 # The stock test.yml uses org-only Namespace runners that don't exist on forks.
 
 on:
   push:
-    branches: [hebrew-bidi]
+    branches: [hebrew-bidi, ivrix-bidi-2026-09]
   workflow_dispatch: {}
 
 jobs:
   test-lib-vt:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: false
-      - name: Install zig 0.15.2
+      - name: Install zig 0.16.0
         run: |
           set -euo pipefail
-          curl -fsSL -o zig.tar.xz https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
+          curl -fsSL -o zig.tar.xz https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
           tar xf zig.tar.xz
-          echo "$PWD/zig-aarch64-macos-0.15.2" >> "$GITHUB_PATH"
+          echo "$PWD/zig-aarch64-macos-0.16.0" >> "$GITHUB_PATH"
       - name: zig version
         run: zig version
       - name: Run lib-vt tests (incl. bidi engine + adapter)
@@ -29,20 +29,20 @@ jobs:
 
   # Compiles the full app (font shaper + renderer) so shaper/renderer bidi
   # changes are verified to build, and runs the bidi-related unit tests.
-  # macos-15 (Xcode 16 / SDK 15.x): new enough for ghostty's CoreVideo usage
-  # (kCVPixelFormatType_30RGB_r210), still old enough for zig 0.15.2 to link.
+  # macos-15: new enough for ghostty CoreVideo usage
+  # (kCVPixelFormatType_30RGB_r210).
   build-and-test-app:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: false
-      - name: Install zig 0.15.2
+      - name: Install zig 0.16.0
         run: |
           set -euo pipefail
-          curl -fsSL -o zig.tar.xz https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
+          curl -fsSL -o zig.tar.xz https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
           tar xf zig.tar.xz
-          echo "$PWD/zig-aarch64-macos-0.15.2" >> "$GITHUB_PATH"
+          echo "$PWD/zig-aarch64-macos-0.16.0" >> "$GITHUB_PATH"
       # Ship build: universal (arm64 + x86_64) ReleaseFast GhosttyKit, no app
       # signing step (CI can't satisfy it). Universal so colleagues on Intel or
       # Apple Silicon both work.
